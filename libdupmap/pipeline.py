@@ -205,20 +205,7 @@ def check_config(config):
             raise ValueError(f'Parameter "td_pad_min" is less than 0: {config["td_pad_min"]}')
 
     else:
-        config['td_pad'] = DEFAULT_TD_PAD
-
-    # Table chunksize
-    if 'chunksize' in config:
-        try:
-            config['chunksize'] = int(config['chunksize'])
-        except ValueError as ex:
-            raise ValueError(f'Parameter "chunksize" is not an integer: {str(ex)}')
-
-        if config['chunksize'] < 1:
-            raise ValueError(f'Parameter "chunksize" must be at least 1: {config["chunksize"]}')
-
-    else:
-        config['chunksize'] = DEFAULT_CHUNKSIZE
+        config['td_pad_min'] = DEFAULT_TD_PAD_MIN
 
     # Shell prefix
     config['shell_prefix'] = config.get('shell_prefix', '').strip()

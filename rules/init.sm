@@ -1,0 +1,160 @@
+# Pipeline init tasks
+
+# Split input sources into partitioned FASTAs
+rule dmap_partition_fa:
+    input:
+        bed='data/variants.bed.gz'
+    output:
+        fa=expand('temp/{{map_type}}/fa/part_{part}.fa', part=range(config['partitions']))
+    wildcard_constraints:
+        part=r'\d+',
+        map_type='blast|align'
+    run:
+
+        out_pattern = f'temp/{wildcards.map_type}/fa/part_{{part}}.fa'
+
+        # Read variants (already tagged by partition)
+        df = pd.read_csv(input.bed, sep='\t')
+
+        # Get the partition column for this set
+        if wildcards.map_type == 'blast':
+            part_col = 'PART_BLAST'
+        elif wildcards.map_type == 'align':
+            part_col = 'PART_ALIGN'
+        else:
+            raise RuntimeError(f'Unknown value for the "map_type" wildcard: {wildcards.map_type}')
+
+        df = df.loc[df[part_col] >= 0]  # -1 if ommitted from this map_type
+
+        # Write subset FASTA
+        for part in range(config['partitions']):
+
+            id_set = set(df.loc[df[part_col] == part, 'ID'])
+
+            try:
+                with open(out_pattern.format(part=part), 'wt') as out_file:
+                    Bio.SeqIO.write(
+                        svpoplib.seq.fa_to_record_iter(config['input'], id_set),
+                        out_file,
+                        'fasta'
+                    )
+
+            except Exception as ex:
+                raise RuntimeError(f'Error reading input for partition {part}: {str(ex)}')
+
+
+# Tag records in variant BED file for ONT or Map.
+rule dmap_tag_sv:
+    output:
+        bed='data/variants.bed.gz'
+    run:
+
+        # Read
+        df = pd.read_csv(config['variant_bed'], sep='\t', usecols=('#CHROM', 'POS', 'END', 'ID', 'SVTYPE', 'SVLEN'))
+        df.set_index('ID', inplace=True, drop=False)
+        df.index.name = 'INDEX'
+
+        # Check for required columns
+        missing_col = [col for col in ('#CHROM', 'POS', 'END', 'ID', 'SVTYPE', 'SVLEN') if col not in df.columns]
+
+        if missing_col:
+            raise RuntimeError(f'Missing required columns in the variant BED file: {", ".join(missing_col)}')
+
+        # Check for duplicate IDs
+        if len(set(df['ID'])) != df.shape[0]:
+            dup_list = sorted([chrom for chrom, count in collections.Counter(df['ID']) if count > 1])
+            n_dup = len(dup_list)
+
+            raise RuntimeError('Input variants contain {} duplicate IDs: {}{}'.format(
+                len(dup_list), ', '.join(dup_list[:3]), '...' if len(dup_list) > 3 else ''
+            ))
+
+        # Check FAI
+        df_fai = svpoplib.ref.get_df_fai(config['input_fai'])
+
+        if len(set(df_fai.index)) != df_fai.shape[0]:
+            dup_list = sorted([chrom for chrom, count in collections.Counter(df_fai.index) if count > 1])
+            n_dup = len(dup_list)
+
+            raise RuntimeError('Input FASTA contains {} duplicate keys: {}{}'.format(
+                len(dup_list), ', '.join(dup_list[:3]), '...' if len(dup_list) > 3 else ''
+            ))
+
+        missing_set = set(df['ID']) - set(df_fai.index)
+
+        if missing_set:
+            raise RuntimeError('Input FASTA is missing {} IDs found in the variant callset: {}{}'.format(
+                len(missing_set), ', '.join(sorted(missing_set)[:3]), '...' if len(missing_set) > 3 else ''
+            ))
+
+        # Tag variants for BLAST or Map
+        blast_range_min = config['blast_range_min']
+        blast_range_max = config['blast_range_max']
+        align_range_min = config['align_range_min']
+        align_range_max = config['align_range_max']
+
+        df['TAG_BLAST'] = True
+
+        df['TAG_BLAST'] = df.apply(lambda row: row['TAG_BLAST'] if row['SVLEN'] >= blast_range_min else False, axis=1)
+        if blast_range_max is not None:
+            df['TAG_BLAST'] = df.apply(lambda row: row['TAG_BLAST'] if row['SVLEN'] <= blast_range_max else False, axis=1)
+
+        df['TAG_ALIGN'] = True
+
+        df['TAG_ALIGN'] = df.apply(lambda row: row['TAG_ALIGN'] if row['SVLEN'] >= align_range_min else False, axis=1)
+        if align_range_max is not None:
+            df['TAG_ALIGN'] = df.apply(lambda row: row['TAG_ALIGN'] if row['SVLEN'] <= align_range_max else False, axis=1)
+
+        # Assign partitions - BLAST
+        if config['partitions'] > 1:
+            partitions = libdupmap.partition_chrom.partition(df.loc[df['TAG_BLAST']].set_index('ID')['SVLEN'], config['partitions'])
+        else:
+            partitions = [tuple(sorted(df.loc[df['TAG_BLAST'], 'ID']))]
+
+        df['PART_BLAST'] = pd.Series({
+            id: part for part in range(len(partitions)) for id in partitions[part]
+        })
+
+        df['PART_BLAST'] = df['PART_BLAST'].fillna(-1).astype(int)
+
+        del(df['TAG_BLAST'])
+
+        # Assign partitions - Align
+        if config['partitions'] > 1:
+            partitions = libdupmap.partition_chrom.partition(df.loc[df['TAG_ALIGN']].set_index('ID')['SVLEN'], config['partitions'])
+        else:
+            partitions = [tuple(sorted(df.loc[df['TAG_ALIGN'], 'ID']))]
+
+        df['PART_ALIGN'] = pd.Series({
+            id: part for part in range(len(partitions)) for id in partitions[part]
+        })
+
+        df['PART_ALIGN'] = df['PART_ALIGN'].fillna(-1).astype(int)
+
+        del (df['TAG_ALIGN'])
+
+        # Write
+        df.to_csv(output.bed, sep='\t', index=False, compression='gzip')
+
+# Make filter BED
+rule dmap_make_filter_bed:
+    output:
+        bed='data/filter.bed.gz'
+    threads: 1
+    run:
+
+        # Get reference masked locations
+        df_mask = libdupmap.ref.masked_fasta_to_bed(
+            config['reference'],
+            soft=config['ref_soft_mask'],
+            dist=config['mask_merge_dist']
+        )
+
+        # Merge
+        df_mask = libdupmap.ref.merge_regions(
+            [df_mask] + config['mask_bed_list'],
+            dist=config['mask_merge_dist']
+        )
+
+        # Write
+        df_mask.to_csv(output.bed, sep='\t', index=False, compression='gzip')
