@@ -41,6 +41,9 @@ def masked_fasta_to_bed(fa_file_name, soft=True, dist=20):
         cur_pos, cur_end = match.span()
         end_dist = cur_end + dist
 
+        if cur_pos < dist:
+            cur_pos = 0
+
         for match in re.finditer(mask_pattern, str(record.seq)):
 
             pos, end = match.span()
@@ -55,6 +58,10 @@ def masked_fasta_to_bed(fa_file_name, soft=True, dist=20):
             elif end > cur_end:  # Extend current record
                 cur_end = end
                 end_dist = end + dist
+
+        # Move to end if less than dist
+        if len(record.seq) - cur_end < dist:
+            cur_end = len(record.seq)
 
         # Append last record
         record_list.append((record.id, cur_pos, cur_end))
