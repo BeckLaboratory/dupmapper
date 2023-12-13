@@ -3,9 +3,9 @@
 # Write BLAST xlsx
 rule eshift_td_anno_insdel_xlsx:
     input:
-        bed='td_blast.bed.gz'
+        bed='results/{sample}/blast/td_sv_{svtype}.bed.gz'
     output:
-        xlsx='td_blast.xlsx'
+        xlsx='results/{sample}/blast/td_sv_{svtype}.xlsx'
     run:
 
         pd.read_csv(
@@ -14,35 +14,16 @@ rule eshift_td_anno_insdel_xlsx:
             output.xlsx, index=False
         )
 
-# Merge INS/DEL
-rule eshift_td_anno_insdel:
-    input:
-        bed_ins='temp/blast/td_anno_sv_ins.bed.gz',
-        bed_del='temp/blast/td_anno_sv_del.bed.gz'
-    output:
-        bed='td_blast.bed.gz'
-    params:
-        cluster_opts='--mem=512 -t 00:10'
-    run:
-
-        df = pd.concat(
-            [
-                pd.read_csv(input.bed_ins, sep='\t'),
-                pd.read_csv(input.bed_del, sep='\t')
-            ], axis=0
-        ).to_csv(
-            output.bed, sep='\t', index=False, compression='gzip'
-        )
-
 # Annotate TDs using BLAST hits.
 rule eshift_td_anno:
     input:
-        bed='temp/blast/filtered_td_sv_{svtype}.bed.gz',
-        bed_sv='data/variants.bed.gz'
+        bed='temp/{sample}/blast/filtered_td_sv_{svtype}.bed.gz',
+        bed_sv='temp/{sample}/input/sv_{svtype}.bed.gz'
     output:
-        bed=temp('temp/blast/td_anno_sv_{svtype}.bed.gz')
+        bed='results/{sample}/blast/td_sv_{svtype}.bed.gz'
     params:
         min_len=30
+    threads: 1
     run:
 
         # Read BLAST records
@@ -284,14 +265,15 @@ rule eshift_td_anno:
 # Apply basic filters - BLAST hits must land proximally to SV breakpoints
 rule dmap_td_blast_prox:
     input:
-        bed='blast/blast_full.bed.gz',
-        bed_sv='data/variants.bed.gz'
+        bed='results/{sample}/blast/blast_full.bed.gz',
+        bed_sv='temp/{sample}/input/sv_{svtype}.bed.gz'
     output:
-        bed=temp('temp/blast/filtered_td_sv_{svtype}.bed.gz')
+        bed=temp('temp/{sample}/blast/filtered_td_sv_{svtype}.bed.gz')
     params:
         chunksize=50000
     wildcard_constraints:
         svtype='ins|del'
+    threads: 1
     run:
 
         # Read variant BED
@@ -370,9 +352,9 @@ rule dmap_td_blast_prox:
 # Merge full BLAST output.
 rule dmap_blast_merge_full:
     input:
-        bed=expand('temp/blast/part/blast_{part}.bed.gz', part=range(config['partitions']))
+        bed=expand('temp/{{sample}}/blast/part/part_{part}.bed.gz', part=range(config['partitions']))
     output:
-        bed='blast/blast_full.bed.gz'
+        bed='results/{sample}/blast/blast_full.bed.gz'
     threads: 1
     run:
 
@@ -389,24 +371,24 @@ rule dmap_blast_merge_full:
                 write_header = False
 
 # Run BLAST.
-rule dmap_blast:
+rule dmap_blast_run:
     input:
-        fa='temp/blast/fa/part_{part}.fa',
-        bed_filter='data/filter.bed.gz'
+        fa='temp/{sample}/input/fa_part/part_{part}.fa',
+        bed_filter='data/ref/filter.bed.gz'
     output:
-        bed=temp('temp/blast/part/blast_{part}.bed.gz')
-    threads: 4
+        bed=temp('temp/{sample}/blast/part/part_{part}.bed.gz')
+    threads: 32
     params:
         temp_dir=lambda wildcards: os.path.join(config['temp_dir'], 'blast_{wildcards.part}'),
         blast_db=config['blast_db'],
+        blast_param=config['blast_param'],
         chunksize=5000,
-        filter_blast=os.path.join(workflow.basedir, 'scripts', 'filter_blast.py')
+        filter_blast=os.path.join(DMAP_DIR, 'scripts', 'filter_blast.py')
     shell:
         """blastn -db {params.blast_db} """
             """-num_threads {threads} """
             """-outfmt "6 saccver sstart send qseqid qstart qend sstrand evalue mismatch gaps pident" """
-            """-word_size 16 """
-            """-perc_identity 95 """
+            """{params.blast_param} """
             """-query {input.fa} | """
         """{params.filter_blast} -b {input.bed_filter} -t {params.temp_dir} -c {params.chunksize} -v | """
         """gzip > {output.bed}"""
